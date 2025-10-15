@@ -1,0 +1,1846 @@
+diff -r 7d6e6531de61 etc/build.props
+--- a/etc/build.props	Sun Sep 07 22:37:57 2025 +0100
++++ b/etc/build.props	Wed Oct 15 15:21:26 2025 +0200
+@@ -286,6 +286,9 @@
+   src/Tools/VSCode/src/preview_panel.scala \
+   src/Tools/VSCode/src/state_panel.scala \
+   src/Tools/VSCode/src/vscode_main.scala \
++  src/Tools/VSCode/src/vscode_metric.scala \
++  src/Tools/VSCode/src/vscode_metric_manager.scala \
++  src/Tools/VSCode/src/vscode_metric_store.scala \
+   src/Tools/VSCode/src/vscode_model.scala \
+   src/Tools/VSCode/src/vscode_rendering.scala \
+   src/Tools/VSCode/src/vscode_resources.scala \
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/MANIFEST
+--- a/src/Tools/VSCode/extension/MANIFEST	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/MANIFEST	Wed Oct 15 15:21:26 2025 +0200
+@@ -4,13 +4,16 @@
+ isabelle.png
+ isabelle_vscode.png
+ media/main.js
++media/metric_agent_script.js
+ media/Preview_inverse.svg
+ media/PreviewOnRightPane_16x_dark.svg
+ media/PreviewOnRightPane_16x.svg
+ media/Preview.svg
++media/state_panel_script.js
+ media/ViewSource_inverse.svg
+ media/ViewSource.svg
+ media/vscode.css
++media/vscode_api_singleton.js
+ package.json
+ README.md
+ src/decorations.ts
+@@ -18,6 +21,7 @@
+ src/file.ts
+ src/library.ts
+ src/lsp.ts
++src/metric_agent.ts
+ src/output_view.ts
+ src/platform.ts
+ src/preview_panel.ts
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/PRETTYPRINT_README.md
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/extension/PRETTYPRINT_README.md	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,175 @@
++# Optimized Pretty-Printing Metrics for Isabelle/VSCode
++
++Make VSCode's rendered output match Isabelle's pretty printer by using **frontend-measured widths** for symbols and an **exact panel margin**, as well as fixing a bug in pretty_text_panel.scala.
++
++## Why
++
++Classic `Symbol.Metric` (codepoint/character based) can diverge from what the VSCode WebView actually renders. This project adds:
++
++- **Measured symbol widths** from the WebView (`metric_agent.ts` adds to backend `vscode_metric.scala`)
++- **Exact panel margin** (based on the state panel's text width)
++- A **store + manager** to persist, select and refresh metrics
++- A **bug fix** in calling `Pretty.formatted()` for stable line breaking and indentation
++
++---
++
++## Changes and new files
++
++```
++In `Isabelle/src/Tools/VSCode/extension/media`:
++ - (NEW) state_panel_script.js        -> measure panel width, resize observers with initializing
++ - (NEW) metric_agent_script.js       -> measure symbol widths with CSS from output_view.ts
++ - (NEW) vscode_api_singleton.js      -> helper (only one vscode instance via acquireVsCodeApi())
++ - (CHANGED) main.js                  -> uses the vscode singleton
++
++In `Isabelle/src/Tools/VSCode/extension/src`:
++ - (CHANGED) state_panel.ts           -> sends textfield margin (chars) via LSP, switch between metrics
++ - (CHANGED) extension.ts             -> starts metric_agent, when language server is ready
++ - (CHANGED) output_view.ts           -> uses the vscode singleton
++ - (CHANGED) lsp.ts                   -> metric_probe, metric_need, metric_set (and their types)
++ - (NEW) metric_agent.ts              -> send table + fingerprint via LSP
++
++In `Isabelle/src/Tools/VSCode/src`:
++ - (NEW) vscode_metric.scala          -> metric implementing usage of measured widths
++ - (NEW) metric_manager.scala         -> selection, handshake, refresh/debounce
++ - (NEW) metric_store.scala           -> JSON persistence, fingerprinting
++ - (CHANGED) pretty_text_panel.scala  -> uses Metric in Pretty.formatted(); bug fixed (breakgain parameter)
++```
++
++---
++
++## Data Flow (end-to-end)
++
++1. **State panel opens / resizes** -> `state_panel_script.js` measures text panel width in **px**, converts to **margin (chars)** using the active font setting to measure char width -> passes it to `state_panel.ts` -> `PIDE/state_set_margin {id, margin}`.
++2. **Font fingerprint** (family + size) is derived in `metric_agent.ts` on startup -> sent to language server.
++3. **Metric_Manager.scala** checks **Metric_Store.scala**:
++    - If table for fingerprint exists -> activate `VSCode_Metric`.
++    - Else -> request measurement from `metric_agent.ts` (Metric_Need(need, symbols?)).
++4. **metric_agent.ts** measures widths (px) for codepoints & Isabelle symbols -> returns table.
++5. **Metric_Store** persists; **Metric_Manager** activates metric and triggers **reformat**.
++6. `pretty.scala` calls `formatted(xml, margin, breakgain, metric)` -> output lines and breaks that match the WebView's actual rendering.
++
++---
++
++## Component Details
++
++### `VSCode_Metric.scala`
++
++Implements the `Metric` interface used by `pretty.scala`.
++
++- **Purpose:** return **string widths** in "character units" resulting from measured width input of symbols.
++- **Core API:**
++  ```scala
++  trait Metric { def apply(s: String): Double }
++  ```
++- **Logic:**
++    - Looks up width in a **width table** (`Map[Int, Double]`).
++    - Returns relative char Units.
++    - **Fallback** per missing entry: 1.0.
++- **Input:**
++    - `WidthTable:  [codepoint, relative width][]`
++    - A string as parameter for `apply()`
++- **Outputs:** `Double` width consistent with pretty's expectations.
++
++---
++
++### `Metric_Manager.scala`
++
++Selects, activates, and refreshes the active metric per panel/session.
++
++- **Responsibilities:**
++    - **Selection:** choose `VSCode_Metric` if a table is present; otherwise `Symbol.Metric`.
++    - **Handshake:** when fingerprint unknown -> request measurement.
++    - **Reformat triggers:** on metric activation on startup or active user change (coded in fingerprint string).
++
++- **Important methods:**
++  ```scala
++  def should_probe(fp: String): Boolean //returns wether or not a width table is available for the fingerprint
++
++  def current_metric_or_default(): Pretty.Metric //returns a valid metric (either Symbol.Metric or VSCode_Metric)
++  ```
++---
++
++### `Metric_Store.scala`
++
++Persistence for width tables keyed by `Fingerprint`.
++
++- **API:**
++  ```scala
++  def get(fp: String): Option[Map[Int, Double]] //return a width table for a fingerprint
++  def put(fp: String, tab: Map[Int, Double]): Unit //set a width table
++  def load(): Unit //load from .json file
++  private def save(): Unit //save to .json file
++  ```
++- **Format (example):**
++  ```json
++  {
++    "tables":
++      {"'Isabelle DejaVu Sans Mono'_16px":[[60,1],[62,1],[65,1],[66,1],[67,1],[68,1]]}
++  }
++  ```
++
++---
++
++### `metric_agent_script.js`
++
++Measures widths under the **exact same CSS** as the panel.
++
++- Wait for fonts: `await document.fonts.ready`.
++- Measure via `getBoundingClientRect()`.
++- Measure all Isabelle symbols (symbol input as codepoint array)
++- Send `{ width_table }` to the `metric_agent.ts`.
++
++**Key points**
++
++- Use the same `font-family` and `font-size` as the state panel (from context by using output_view.ts).
++
++---
++
++### `metric_agent.ts`
++
++Sends fingerprint, receives symbol codepoint table from backend, passes it on to `metric_agent_script.js`, receives measured widths as array [codepoint, relative_size][] from it and passes it on to the backend.
++
++
++---
++
++### `state_panel_script.js` — measured **panel width / 'x' -> margin**, initiate metric switch
++
++Converts **px width** of the state panel text field and a character into a **correct margin in characters** and sends `PIDE/state_panel_resize { id, margin }` at initiation and at resize events.
++
++Switch: either send `switch_to_symbol_metric` or actual fingerprint with measured fontFamily and size
++(gets caught and forwarded by `state_panel.ts` )
++
++---
++
++### `state_panel.ts` — listens to changed resize event, pass on fingerprints from inline script
++
++Receives "state_panel_resize" instead of "resize" to update margin in backend.
++Forwards fingerprint from inline script to backend via LSP.
++
++---
++
++### `pretty_text_panel.scala` — bug fix in calling of `Pretty.formatted()`
++
++**Symptom:** In many cases, lines broke badly - especially after working with the more exact text panel widths and resulting margins from state panel.
++
++**Fix:** set breakgain based on margin
++```scala
++val formatted =
++      Pretty.formatted(Pretty.separate(output), margin = margin, breakgain = margin/20, metric = metric)
++```
++
++Also input for metric (as shown above).
++
++**Outcome:** Stable indentation and break placement, consistent with measured widths and panel margin.
++
++---
++
++## Settings and output files
++
++Set logging booleans:
++- LOG_LINE_BREAKS in `pretty_text_panel.scala` to output linebreaks counted from newline character in the output string
++- LOG_LINE_BREAKS in `state_panel_script.js` to log actual rendered line count to console
++- LOG_SYMBOL_WIDTHS_TO_FILE -> .csv files with the metrics and their codepoint are also stored in /tmp for easier data processing (the exact path is shown in the VSCode Isabelle Output)
++
++- `metric_store.json` is deposited in .isabelle/vscode by `vscode_metric.scala`
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/media/main.js
+--- a/src/Tools/VSCode/extension/media/main.js	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/media/main.js	Wed Oct 15 15:21:26 2025 +0200
+@@ -1,5 +1,5 @@
+ (function () {
+-    const vscode = acquireVsCodeApi();
++    const vscode = window.vscode
+ 
+     for (const link of document.querySelectorAll('a[href^="file:"]')) {
+         link.addEventListener('click', () => {
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/media/metric_agent_script.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/extension/media/metric_agent_script.js	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,51 @@
++/*  Author:     Ali Prokoph
++
++Inline script of metric_agent.ts to measure symbol widths at the same conditions as output_view.ts.
++*/
++
++(function () {
++    const vscode =  window.vscode
++    const { symbols } = window._INIT
++
++    let root = document.getElementById('isabelle-content');
++
++    const cs = getComputedStyle(root);
++
++    root.style.fontFamily = cs.fontFamily
++    root.style.fontSize = cs.fontSize;
++
++    function measure_char_width_px(ch) {
++        let span = document.createElement('span');
++        span.textContent = ch;
++        span.style.visibility = 'hidden';
++        span.style.whiteSpace = 'pre';
++        span.style.fontFamily = root.style.fontFamily
++        span.style.fontSize = root.style.fontSize
++        span.style.fontWeight = cs.fontWeight;
++        root.appendChild(span);
++        let width = span.getBoundingClientRect().width;
++        span.remove();
++        return width;
++    }
++
++    (async function run() {
++        const cs = getComputedStyle(root);
++
++        await document.fonts?.load(`${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${root.style.fontFamily}`);
++        await document.fonts?.ready;
++        await new Promise(r => requestAnimationFrame(r));
++
++        let unicode_char_width = measure_char_width_px('x');
++        let symbols_code_points = symbols || [];
++        let output = [];
++        for (let i = 0; i < symbols_code_points.length; i++) {
++            let code_point = symbols_code_points[i];
++            let string = String.fromCodePoint(code_point);
++            let ratio = measure_char_width_px(string) / unicode_char_width;
++            if (Number.isFinite(ratio)) {
++                output.push([code_point, +ratio.toFixed(3)]);
++            }
++        }
++        vscode.postMessage({ command: 'metric_width_table', widthTable: output });
++    })();
++})();
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/media/state_panel_script.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/extension/media/state_panel_script.js	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,152 @@
++/*  Author:     Ali Prokoph
++
++Inline script to measure the margin exactly,
++send user input of the metric switch to the language server,
++and log the line count of state_panel.ts.
++*/
++
++(function () {
++    const vscode = window.vscode;
++
++    const LOG_LINE_BREAKS = true
++
++    let initialized = false;
++    let observers_wired = false;
++    let last_margin = null;
++    let raf_scheduled = false;
++
++    let metrics_enabled = true;
++
++    function root_element() { return document.getElementById("isabelle-content") }
++    function get_pre_element() {
++        return document.querySelector('pre.source') || document.querySelector('pre');
++    }
++
++    function set_content(html) { const el = root_element(); if (el) el.innerHTML = html; }
++
++    function computed_line_height_px(el) {
++        const computed_style = getComputedStyle(el);
++        const line_height = computed_style.lineHeight;
++        if (line_height !== 'normal') return parseFloat(line_height);
++        const probe = document.createElement('span');
++        probe.textContent = 'X';
++        probe.style.visibility = 'hidden';
++        probe.style.whiteSpace = 'nowrap';
++        el.appendChild(probe);
++        const height = probe.getBoundingClientRect().height;
++        el.removeChild(probe);
++        return height;
++    }
++
++    function get_visual_line_count(pre_element) {
++        const computed_style = getComputedStyle(pre_element);
++        const padding = parseFloat(computed_style.paddingTop) + parseFloat(computed_style.paddingBottom);
++        const border = parseFloat(computed_style.borderTopWidth) + parseFloat(computed_style.borderBottomWidth);
++        const height = pre_element.getBoundingClientRect().height - padding - border;
++        const line_height = computed_line_height_px(pre_element);
++        return Math.max(0, Math.round(height / line_height));
++    }
++
++    function get_fingerprint_str() {
++        const cs = getComputedStyle(root_element());
++        const family = cs.fontFamily.replace(/['"]/g, "'");
++        const size = cs.fontSize
++        return `${family}_${size}`
++    }
++    function measure_char_width_px(ch) {
++        const span = document.createElement("span");
++        span.textContent = ch;
++        span.style.visibility = "hidden";
++        document.body.appendChild(span);
++        const w = span.getBoundingClientRect().width; span.remove(); return w;
++    }
++    function measure_text_width_px() {
++        return root_element().getBoundingClientRect().width;
++    }
++
++    function send_margin_only(tag) {
++        const textW = measure_text_width_px();
++        const cw = measure_char_width_px("x");
++        const margin = Math.floor(textW / Math.max(0.01, cw));
++        if (margin !== last_margin) {
++            last_margin = margin;
++            vscode.postMessage({ command: "state_panel_resize", margin });
++        }
++    }
++
++    function schedule_update(tag) {
++        if (raf_scheduled) return;
++        raf_scheduled = true;
++        requestAnimationFrame(function () {
++            raf_scheduled = false;
++            send_margin_only(tag);
++        });
++    }
++
++    function setup_resize_observers() {
++        if (observers_wired) return;
++        observers_wired = true;
++        const root = root_element();
++
++        if (window.ResizeObserver) {
++            const resize_observer = new ResizeObserver(function () { schedule_update("ResizeObserver"); });
++            resize_observer.observe(root);
++        }
++        window.addEventListener("resize", function () { schedule_update("window.resize"); });
++        if (window.visualViewport) {
++            visualViewport.addEventListener("resize", function () { schedule_update("visualViewport.resize"); });
++        }
++    }
++
++    function set_metrics_checked_toggle() {
++        const el = document.getElementById('sendingMetrics');
++        if (!(el instanceof HTMLInputElement)) return;
++
++        metrics_enabled = el.checked;
++        el.addEventListener('change', () => {
++            metrics_enabled = el.checked;
++            console.log("metricsEnabled: "+metrics_enabled)
++            if (metrics_enabled) {
++                vscode.postMessage({ command: "send_fingerprint", fingerprint: get_fingerprint_str() });
++            } else {
++                vscode.postMessage({ command: "send_fingerprint", fingerprint: "switch_to_symbol_metric" });
++            }
++        });
++    }
++
++    function init_once() {
++        if (initialized) return;
++        initialized = true;
++        send_margin_only("load");
++        setup_resize_observers();
++        set_metrics_checked_toggle();
++    }
++
++    window.addEventListener("message", function (ev) {
++        const msg = ev.data || {};
++        if (msg.command === "state_id"){
++            window.state_id = msg.id;
++        }
++        else if (msg.command === "set_content") {
++            set_content(msg.content);
++            requestAnimationFrame(function () {
++                if (LOG_LINE_BREAKS) {
++                    const pre = get_pre_element();
++                    if (!pre) return;
++                    const visual_lines = get_visual_line_count(pre);
++                    console.log("[Zeilenzahlen: Höhe pre-Element/lineheight]: " + visual_lines)
++                }
++                schedule_update("set_content");
++            });
++        }
++    });
++
++    window.addEventListener("load", function () {
++        console.log("[webview] onload fired");
++        requestAnimationFrame(() => {
++            requestAnimationFrame(() => {
++                init_once();
++            });
++        });
++    });
++})();
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/media/vscode_api_singleton.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/extension/media/vscode_api_singleton.js	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,11 @@
++/*  Author:     Ali Prokoph
++
++Singleton to ensure only one instance of vscode API exists.
++*/
++
++(function () {
++    const w = window;
++    if (!w.vscode) {
++        w.vscode = acquireVsCodeApi();
++    }
++})();
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/package.json
+--- a/src/Tools/VSCode/extension/package.json	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/package.json	Wed Oct 15 15:21:26 2025 +0200
+@@ -319,6 +319,7 @@
+         "typescript": "^4.5.5"
+     },
+     "dependencies": {
++        "@types/vscode-webview": "^1.57.5",
+         "vscode-languageclient": "~7.0.0",
+         "vscode-languageserver-types": "~3.16.0"
+     }
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/src/extension.ts
+--- a/src/Tools/VSCode/extension/src/extension.ts	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/src/extension.ts	Wed Oct 15 15:21:26 2025 +0200
+@@ -15,6 +15,7 @@
+ import * as preview_panel from './preview_panel'
+ import * as lsp from './lsp'
+ import * as state_panel from './state_panel'
++import * as metric_agent from './metric_agent'
+ import { Uri, TextEditor, ViewColumn, Selection, Position, ExtensionContext, workspace, window,
+   commands, ProgressLocation } from 'vscode'
+ import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-languageclient/node'
+@@ -123,7 +124,7 @@
+           progress.report({
+             message: "Waiting for Isabelle language server..."
+           })
+-          await language_client.onReady()
++          await language_client.onReady().then(() => metric_agent.start(context, language_client))
+         })
+ 
+ 
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/src/lsp.ts
+--- a/src/Tools/VSCode/extension/src/lsp.ts	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/src/lsp.ts	Wed Oct 15 15:21:26 2025 +0200
+@@ -94,6 +94,22 @@
+ export const state_set_margin_type =
+   new NotificationType<State_Set_Margin>("PIDE/state_set_margin")
+ 
++export interface Metric_Set {
++  fingerprint: string; widthTable: [number, number][]
++}
++export const metric_set = new NotificationType<Metric_Set>("PIDE/metric_set")
++
++export interface Metric_Need {
++  need: boolean;
++  symbols: number[]
++}
++export const metric_need = new NotificationType<Metric_Need>("PIDE/metric_need")
++
++export interface Metric_Probe {
++  fingerprint: string;
++}
++export const metric_probe = new NotificationType<Metric_Probe>("PIDE/metric_probe")
++
+ export interface State_Id
+ {
+   id: number
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/src/metric_agent.ts
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/extension/src/metric_agent.ts	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,75 @@
++/*  Author:     Ali Prokoph
++
++Extension to measure symbol widths under the same conditions as output_view.ts.
++Extension is started from extension.ts, when language server is ready.
++*/
++
++import * as vscode from 'vscode'
++import { LanguageClient } from 'vscode-languageclient/node'
++import * as lsp from './lsp'
++import {get_webview_html} from "./output_view";
++
++export function start(context: vscode.ExtensionContext, client: LanguageClient) {
++    const get_fingerprint = () => `${read_editor_font_family()}_${read_editor_font_size()}px`
++    client.onReady().then(() => {
++        client.onNotification(lsp.metric_need, async ({ need, symbols }) => {
++            if (!need) return
++            const table = await measure_in_hidden_webview(context, symbols)
++            client.sendNotification(lsp.metric_set, { fingerprint: get_fingerprint(), widthTable: table })
++        })
++        client.sendNotification(lsp.metric_probe, { fingerprint: get_fingerprint() })
++    })
++}
++
++function read_editor_font_family(): string {
++    const config = vscode.workspace.getConfiguration('editor')
++    return String(config.get('fontFamily'))
++}
++
++function read_editor_font_size(): number {
++    const config = vscode.workspace.getConfiguration('editor')
++    return Number(config.get('fontSize'))
++}
++
++async function measure_in_hidden_webview(
++    context: vscode.ExtensionContext,
++    symbols: number[]
++): Promise<[number, number][]> {
++    const panel = vscode.window.createWebviewPanel(
++        'isabelle-metric-measure',
++        'Isabelle Metric Measure',
++        { viewColumn: vscode.ViewColumn.Active, preserveFocus: true },
++        { enableScripts: true, localResourceRoots: [context.extensionUri] }
++    )
++
++    const vscode_uri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'vscode_api_singleton.js'))
++    const script_uri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'metric_agent_script.js'))
++
++    const content =  `
++        <div id="isabelle-content"></div>
++        <script src="${vscode_uri}"></script>
++        <script>
++         (function() {
++           window._INIT = ${JSON.stringify({
++            symbols
++           })
++          };
++         })();
++        </script>
++        <script src='${script_uri}'></script>
++    `;
++
++    return new Promise(resolve => {
++        let resolved = false;
++
++        panel.webview.onDidReceiveMessage(async (msg: any) => {
++            if (!resolved && msg?.command === "metric_width_table" && Array.isArray(msg.widthTable)) {
++                resolved = true;
++                resolve(msg.widthTable);
++                panel.dispose();
++                return;
++            }
++        });
++        panel.webview.html = get_webview_html(content, panel.webview, context.extensionUri.fsPath)
++    })
++}
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/src/output_view.ts
+--- a/src/Tools/VSCode/extension/src/output_view.ts	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/src/output_view.ts	Wed Oct 15 15:21:26 2025 +0200
+@@ -87,6 +87,7 @@
+ 
+ function get_webview_html(content: string, webview: Webview, extension_path: string): string
+ {
++  const vscode_uri = webview.asWebviewUri(Uri.file(path.join(extension_path, 'media', 'vscode_api_singleton.js')))
+   const script_uri = webview.asWebviewUri(Uri.file(path.join(extension_path, 'media', 'main.js')))
+   const css_uri = webview.asWebviewUri(Uri.file(path.join(extension_path, 'media', 'vscode.css')))
+   const font_uri =
+@@ -109,6 +110,7 @@
+       </head>
+       <body>
+         ${content}
++        <script src="${vscode_uri}"></script>
+         <script src='${script_uri}'></script>
+       </body>
+     </html>`
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/src/state_panel.ts
+--- a/src/Tools/VSCode/extension/src/state_panel.ts	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/src/state_panel.ts	Wed Oct 15 15:21:26 2025 +0200
+@@ -10,6 +10,7 @@
+ import {LanguageClient} from 'vscode-languageclient/node'
+ import {ExtensionContext, Uri, ViewColumn, WebviewPanel, window} from 'vscode'
+ import {get_webview_html, open_webview_link} from './output_view'
++import * as path from 'path'
+ 
+ 
+ let language_client: LanguageClient
+@@ -26,12 +27,22 @@
+   private _extension_path: string
+ 
+   public get_id(): number { return this.state_id }
+-  public check_id(id: number): boolean { return this.state_id === id }
++  // public check_id(id: number): boolean { return this.state_id === id }
++
++  private initialized: boolean = false;
+ 
+-  public set_content(state: lsp.State_Output)
+-  {
++  public set_content(state: lsp.State_Output) {
+     this.state_id = state.id
+-    this.webview_panel.webview.html = this._get_html(state.content, state.auto_update)
++    if (!this.initialized) {
++      this.webview_panel.webview.html = this._get_html(state.content ?? "", state.auto_update)
++      this.initialized = true
++      this.webview_panel.webview.postMessage({ command: "state_id", id: this.state_id })
++    }
++
++    this.webview_panel.webview.postMessage({
++      command: "set_content",
++      content: state.content,
++    })
+   }
+ 
+   public reveal()
+@@ -43,7 +54,9 @@
+   {
+     this._extension_path = extension_path
+     this.webview_panel = window.createWebviewPanel("isabelle-state", "State",
+-      panel_column(), { enableScripts: true })
++      panel_column(), {
++          enableScripts: true,
++        })
+     this.webview_panel.onDidDispose(exit_panel)
+     this.webview_panel.webview.onDidReceiveMessage(message =>
+     {
+@@ -61,11 +74,15 @@
+         case "open":
+           open_webview_link(message.link)
+           break
+-        case "resize":
++        case "state_panel_resize":
+           language_client.sendNotification(
+             lsp.state_set_margin_type, { id: this.state_id, margin: message.margin })
+           break
++        case "send_fingerprint":
++          language_client.sendNotification("PIDE/metric_probe", { fingerprint: message.fingerprint});
++          break
+         default:
++          console.log("[state_panel.ts/onDidReceiveMessage] fell through: " + message.command)
+           break
+       }
+     })
+@@ -75,13 +92,29 @@
+   {
+     const webview = this.webview_panel.webview
+     const checked = auto_update ? "checked" : ""
++
++    const vscode_uri = webview.asWebviewUri(Uri.file(path.join(this._extension_path, 'media', 'vscode_api_singleton.js')))
++    const script_uri = webview.asWebviewUri(Uri.file(path.join(this._extension_path, 'media', 'state_panel_script.js')))
++
++    const metricsChecked = true
++    const metricsCheckedAttr = metricsChecked ? "checked" : "";
++
+     const content_with_buttons = `<div id="controls">
++      <input type="checkbox" id="sendingMetrics" ${metricsCheckedAttr}/>
++      <label for="sendingMetrics">Sending Metrics</label>
++      
+       <input type="checkbox" id="auto_update" ${checked}/>
+       <label for="auto_update">Auto update</label>
++      
+       <button id="update_button">Update</button>
+       <button id="locate_button">Locate</button>
+     </div>
+-    ${content}`
++    <div id="isabelle-content">
++        ${content}
++    </div>
++    <script src="${vscode_uri}"></script>
++    <script src='${script_uri}'></script>
++    `
+ 
+     return get_webview_html(content_with_buttons, webview, this._extension_path)
+   }
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/tsconfig.json
+--- a/src/Tools/VSCode/extension/tsconfig.json	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/tsconfig.json	Wed Oct 15 15:21:26 2025 +0200
+@@ -4,8 +4,10 @@
+         "target": "es6",
+         "outDir": "out",
+         "lib": [
+-            "es6"
++            "es6",
++            "dom"
+         ],
++        "skipLibCheck": true,
+         "sourceMap": true,
+         "rootDir": "."
+     },
+diff -r 7d6e6531de61 src/Tools/VSCode/extension/yarn.lock
+--- a/src/Tools/VSCode/extension/yarn.lock	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/extension/yarn.lock	Wed Oct 15 15:21:26 2025 +0200
+@@ -3,93 +3,98 @@
+ 
+ 
+ "@types/mocha@^9.1.0":
+-  version "9.1.0"
+-  resolved "https://registry.yarnpkg.com/@types/mocha/-/mocha-9.1.0.tgz#baf17ab2cca3fcce2d322ebc30454bff487efad5"
+-  integrity sha512-QCWHkbMv4Y5U9oW10Uxbr45qMMSzl4OzijsozynUAgx3kEHUdXB00udx2dWDQ7f2TU2a2uuiFaRZjCe3unPpeg==
++  version "9.1.1"
++  resolved "https://registry.npmjs.org/@types/mocha/-/mocha-9.1.1.tgz"
++  integrity sha512-Z61JK7DKDtdKTWwLeElSEBcWGRLY8g95ic5FoQqI9CMx0ns/Ghep3B4DfcEimiKMvtamNVULVNKEsiwV3aQmXw==
+ 
+ "@types/node@^17.0.19":
+-  version "17.0.21"
+-  resolved "https://registry.yarnpkg.com/@types/node/-/node-17.0.21.tgz#864b987c0c68d07b4345845c3e63b75edd143644"
+-  integrity sha512-DBZCJbhII3r90XbQxI8Y9IjjiiOGlZ0Hr32omXIZvwwZ7p4DMMXGrKXVyPfuoBOri9XNtL0UK69jYIBIsRX3QQ==
++  version "17.0.45"
++  resolved "https://registry.npmjs.org/@types/node/-/node-17.0.45.tgz"
++  integrity sha512-w+tIMs3rq2afQdsPJlODhoUEKzFP1ayaoyl1CcnwtIlsVe7K7bA1NGm4s3PraqTLlXnbIN84zuBlxBWo1u9BLw==
++
++"@types/vscode-webview@^1.57.5":
++  version "1.57.5"
++  resolved "https://registry.npmjs.org/@types/vscode-webview/-/vscode-webview-1.57.5.tgz"
++  integrity sha512-iBAUYNYkz+uk1kdsq05fEcoh8gJmwT3lqqFPN7MGyjQ3HVloViMdo7ZJ8DFIP8WOK74PjOEilosqAyxV2iUFUw==
+ 
+ "@types/vscode@^1.65.0":
+-  version "1.65.0"
+-  resolved "https://registry.yarnpkg.com/@types/vscode/-/vscode-1.65.0.tgz#042dd8d93c32ac62cb826cd0fa12376069d1f448"
+-  integrity sha512-wQhExnh2nEzpjDMSKhUvnNmz3ucpd3E+R7wJkOhBNK3No6fG3VUdmVmMOKD0A8NDZDDDiQcLNxe3oGmX5SjJ5w==
++  version "1.101.0"
++  resolved "https://registry.npmjs.org/@types/vscode/-/vscode-1.101.0.tgz"
++  integrity sha512-ZWf0IWa+NGegdW3iU42AcDTFHWW7fApLdkdnBqwYEtHVIBGbTu0ZNQKP/kX3Ds/uMJXIMQNAojHR4vexCEEz5Q==
+ 
+ "@ungap/promise-all-settled@1.1.2":
+   version "1.1.2"
+-  resolved "https://registry.yarnpkg.com/@ungap/promise-all-settled/-/promise-all-settled-1.1.2.tgz#aa58042711d6e3275dd37dc597e5d31e8c290a44"
++  resolved "https://registry.npmjs.org/@ungap/promise-all-settled/-/promise-all-settled-1.1.2.tgz"
+   integrity sha512-sL/cEvJWAnClXw0wHk85/2L0G6Sj8UB0Ctc1TEMbKSsmpRosqhwj9gWgFRZSrBr2f9tiXISwNhCPmlfqUqyb9Q==
+ 
+ ansi-colors@4.1.1:
+   version "4.1.1"
+-  resolved "https://registry.yarnpkg.com/ansi-colors/-/ansi-colors-4.1.1.tgz#cbb9ae256bf750af1eab344f229aa27fe94ba348"
++  resolved "https://registry.npmjs.org/ansi-colors/-/ansi-colors-4.1.1.tgz"
+   integrity sha512-JoX0apGbHaUJBNl6yF+p6JAFYZ666/hhCGKN5t9QFjbJQKUU/g8MNbFDbvfrgKXvI1QpZplPOnwIo99lX/AAmA==
+ 
+ ansi-regex@^5.0.1:
+   version "5.0.1"
+-  resolved "https://registry.yarnpkg.com/ansi-regex/-/ansi-regex-5.0.1.tgz#082cb2c89c9fe8659a311a53bd6a4dc5301db304"
++  resolved "https://registry.npmjs.org/ansi-regex/-/ansi-regex-5.0.1.tgz"
+   integrity sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==
+ 
+ ansi-styles@^4.0.0, ansi-styles@^4.1.0:
+   version "4.3.0"
+-  resolved "https://registry.yarnpkg.com/ansi-styles/-/ansi-styles-4.3.0.tgz#edd803628ae71c04c85ae7a0906edad34b648937"
++  resolved "https://registry.npmjs.org/ansi-styles/-/ansi-styles-4.3.0.tgz"
+   integrity sha512-zbB9rCJAT1rbjiVDb2hqKFHNYLxgtk8NURxZ3IZwD3F6NtxbXZQCnnSi1Lkx+IDohdPlFp222wVALIheZJQSEg==
+   dependencies:
+     color-convert "^2.0.1"
+ 
+ anymatch@~3.1.2:
+-  version "3.1.2"
+-  resolved "https://registry.yarnpkg.com/anymatch/-/anymatch-3.1.2.tgz#c0557c096af32f106198f4f4e2a383537e378716"
+-  integrity sha512-P43ePfOAIupkguHUycrc4qJ9kz8ZiuOUijaETwX7THt0Y/GNK7v0aa8rY816xWjZ7rJdA5XdMcpVFTKMq+RvWg==
++  version "3.1.3"
++  resolved "https://registry.npmjs.org/anymatch/-/anymatch-3.1.3.tgz"
++  integrity sha512-KMReFUr0B4t+D+OBkjR3KYqvocp2XaSzO55UcB6mgQMd3KbcE+mWTyvVV7D/zsdEbNnV6acZUutkiHQXvTr1Rw==
+   dependencies:
+     normalize-path "^3.0.0"
+     picomatch "^2.0.4"
+ 
+ argparse@^2.0.1:
+   version "2.0.1"
+-  resolved "https://registry.yarnpkg.com/argparse/-/argparse-2.0.1.tgz#246f50f3ca78a3240f6c997e8a9bd1eac49e4b38"
++  resolved "https://registry.npmjs.org/argparse/-/argparse-2.0.1.tgz"
+   integrity sha512-8+9WqebbFzpX9OR+Wa6O29asIogeRMzcGtAINdpMHHyAg10f05aSFVBbcEqGf/PXw1EjAZ+q2/bEBg3DvurK3Q==
+ 
+ balanced-match@^1.0.0:
+   version "1.0.2"
+-  resolved "https://registry.yarnpkg.com/balanced-match/-/balanced-match-1.0.2.tgz#e83e3a7e3f300b34cb9d87f615fa0cbf357690ee"
++  resolved "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.2.tgz"
+   integrity sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==
+ 
+ binary-extensions@^2.0.0:
+-  version "2.2.0"
+-  resolved "https://registry.yarnpkg.com/binary-extensions/-/binary-extensions-2.2.0.tgz#75f502eeaf9ffde42fc98829645be4ea76bd9e2d"
+-  integrity sha512-jDctJ/IVQbZoJykoeHbhXpOlNBqGNcwXJKJog42E5HDPUwQTSdjCHdihjj0DlnheQ7blbT6dHOafNAiS8ooQKA==
++  version "2.3.0"
++  resolved "https://registry.npmjs.org/binary-extensions/-/binary-extensions-2.3.0.tgz"
++  integrity sha512-Ceh+7ox5qe7LJuLHoY0feh3pHuUDHAcRUeyL2VYghZwfpkNIy/+8Ocg0a3UuSoYzavmylwuLWQOf3hl0jjMMIw==
+ 
+ brace-expansion@^1.1.7:
+-  version "1.1.11"
+-  resolved "https://registry.yarnpkg.com/brace-expansion/-/brace-expansion-1.1.11.tgz#3c7fcbf529d87226f3d2f52b966ff5271eb441dd"
+-  integrity sha512-iCuPHDFgrHX7H2vEI/5xpz07zSHB00TpugqhmYtVmMO6518mCuRMoOYFldEBl0g187ufozdaHgWKcYFb61qGiA==
++  version "1.1.12"
++  resolved "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.12.tgz"
++  integrity sha512-9T9UjW3r0UW5c1Q7GTwllptXwhvYmEzFhzMfZ9H7FQWt+uZePjZPjBP/W1ZEyZ1twGWom5/56TF4lPcqjnDHcg==
+   dependencies:
+     balanced-match "^1.0.0"
+     concat-map "0.0.1"
+ 
+ braces@~3.0.2:
+-  version "3.0.2"
+-  resolved "https://registry.yarnpkg.com/braces/-/braces-3.0.2.tgz#3454e1a462ee8d599e236df336cd9ea4f8afe107"
+-  integrity sha512-b8um+L1RzM3WDSzvhm6gIz1yfTbBt6YTlcEKAvsmqCZZFw46z626lVj9j1yEPW33H5H+lBQpZMP1k8l+78Ha0A==
++  version "3.0.3"
++  resolved "https://registry.npmjs.org/braces/-/braces-3.0.3.tgz"
++  integrity sha512-yQbXgO/OSZVD2IsiLlro+7Hf6Q18EJrKSEsdoMzKePKXct3gvD8oLcOQdIzGupr5Fj+EDe8gO/lxc1BzfMpxvA==
+   dependencies:
+-    fill-range "^7.0.1"
++    fill-range "^7.1.1"
+ 
+ browser-stdout@1.3.1:
+   version "1.3.1"
+-  resolved "https://registry.yarnpkg.com/browser-stdout/-/browser-stdout-1.3.1.tgz#baa559ee14ced73452229bad7326467c61fabd60"
++  resolved "https://registry.npmjs.org/browser-stdout/-/browser-stdout-1.3.1.tgz"
+   integrity sha512-qhAVI1+Av2X7qelOfAIYwXONood6XlZE/fXaBSmW/T5SzLAmCgzi+eiWE7fUvbHaeNBQH13UftjpXxsfLkMpgw==
+ 
+ camelcase@^6.0.0:
+   version "6.3.0"
+-  resolved "https://registry.yarnpkg.com/camelcase/-/camelcase-6.3.0.tgz#5685b95eb209ac9c0c177467778c9c84df58ba9a"
++  resolved "https://registry.npmjs.org/camelcase/-/camelcase-6.3.0.tgz"
+   integrity sha512-Gmy6FhYlCY7uOElZUSbxo2UCDH8owEk996gkbrpsgGtrJLM3J7jGxl9Ic7Qwwj4ivOE5AWZWRMecDdF7hqGjFA==
+ 
+ chalk@^4.1.0:
+   version "4.1.2"
+-  resolved "https://registry.yarnpkg.com/chalk/-/chalk-4.1.2.tgz#aac4e2b7734a740867aeb16bf02aad556a1e7a01"
++  resolved "https://registry.npmjs.org/chalk/-/chalk-4.1.2.tgz"
+   integrity sha512-oKnbhFyRIXpUuez8iBMmyEa4nbj4IOQyuhc/wy9kY7/WVPcwIO9VA668Pu8RkO7+0G76SLROeyw9CpQ061i4mA==
+   dependencies:
+     ansi-styles "^4.1.0"
+@@ -97,7 +102,7 @@
+ 
+ chokidar@3.5.3:
+   version "3.5.3"
+-  resolved "https://registry.yarnpkg.com/chokidar/-/chokidar-3.5.3.tgz#1cf37c8707b932bd1af1ae22c0432e2acd1903bd"
++  resolved "https://registry.npmjs.org/chokidar/-/chokidar-3.5.3.tgz"
+   integrity sha512-Dr3sfKRP6oTcjf2JmUmFJfeVMvXBdegxB0iVQ5eb2V10uFJUCAS8OByZdVAyVb8xXNz3GjjTgj9kLWsZTqE6kw==
+   dependencies:
+     anymatch "~3.1.2"
+@@ -112,7 +117,7 @@
+ 
+ cliui@^7.0.2:
+   version "7.0.4"
+-  resolved "https://registry.yarnpkg.com/cliui/-/cliui-7.0.4.tgz#a0265ee655476fc807aea9df3df8df7783808b4f"
++  resolved "https://registry.npmjs.org/cliui/-/cliui-7.0.4.tgz"
+   integrity sha512-OcRE68cOsVMXp1Yvonl/fzkQOyjLSu/8bhPDfQt0e0/Eb283TKP20Fs2MqoPsr9SwA595rRCA+QMzYc9nBP+JQ==
+   dependencies:
+     string-width "^4.2.0"
+@@ -121,63 +126,63 @@
+ 
+ color-convert@^2.0.1:
+   version "2.0.1"
+-  resolved "https://registry.yarnpkg.com/color-convert/-/color-convert-2.0.1.tgz#72d3a68d598c9bdb3af2ad1e84f21d896abd4de3"
++  resolved "https://registry.npmjs.org/color-convert/-/color-convert-2.0.1.tgz"
+   integrity sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==
+   dependencies:
+     color-name "~1.1.4"
+ 
+ color-name@~1.1.4:
+   version "1.1.4"
+-  resolved "https://registry.yarnpkg.com/color-name/-/color-name-1.1.4.tgz#c2a09a87acbde69543de6f63fa3995c826c536a2"
++  resolved "https://registry.npmjs.org/color-name/-/color-name-1.1.4.tgz"
+   integrity sha512-dOy+3AuW3a2wNbZHIuMZpTcgjGuLU/uBL/ubcZF9OXbDo8ff4O8yVp5Bf0efS8uEoYo5q4Fx7dY9OgQGXgAsQA==
+ 
+ concat-map@0.0.1:
+   version "0.0.1"
+-  resolved "https://registry.yarnpkg.com/concat-map/-/concat-map-0.0.1.tgz#d8a96bd77fd68df7793a73036a3ba0d5405d477b"
+-  integrity sha1-2Klr13/Wjfd5OnMDajug1UBdR3s=
++  resolved "https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz"
++  integrity sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==
+ 
+ debug@4.3.3:
+   version "4.3.3"
+-  resolved "https://registry.yarnpkg.com/debug/-/debug-4.3.3.tgz#04266e0b70a98d4462e6e288e38259213332b664"
++  resolved "https://registry.npmjs.org/debug/-/debug-4.3.3.tgz"
+   integrity sha512-/zxw5+vh1Tfv+4Qn7a5nsbcJKPaSvCDhojn6FEl9vupwK2VCSDtEiEtqr8DFtzYFOdz63LBkxec7DYuc2jon6Q==
+   dependencies:
+     ms "2.1.2"
+ 
+ decamelize@^4.0.0:
+   version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/decamelize/-/decamelize-4.0.0.tgz#aa472d7bf660eb15f3494efd531cab7f2a709837"
++  resolved "https://registry.npmjs.org/decamelize/-/decamelize-4.0.0.tgz"
+   integrity sha512-9iE1PgSik9HeIIw2JO94IidnE3eBoQrFJ3w7sFuzSX4DpmZ3v5sZpUiV5Swcf6mQEF+Y0ru8Neo+p+nyh2J+hQ==
+ 
+ diff@5.0.0:
+   version "5.0.0"
+-  resolved "https://registry.yarnpkg.com/diff/-/diff-5.0.0.tgz#7ed6ad76d859d030787ec35855f5b1daf31d852b"
++  resolved "https://registry.npmjs.org/diff/-/diff-5.0.0.tgz"
+   integrity sha512-/VTCrvm5Z0JGty/BWHljh+BAiw3IK+2j87NGMu8Nwc/f48WoDAC395uomO9ZD117ZOBaHmkX1oyLvkVM/aIT3w==
+ 
+ emoji-regex@^8.0.0:
+   version "8.0.0"
+-  resolved "https://registry.yarnpkg.com/emoji-regex/-/emoji-regex-8.0.0.tgz#e818fd69ce5ccfcb404594f842963bf53164cc37"
++  resolved "https://registry.npmjs.org/emoji-regex/-/emoji-regex-8.0.0.tgz"
+   integrity sha512-MSjYzcWNOA0ewAHpz0MxpYFvwg6yjy1NG3xteoqz644VCo/RPgnr1/GGt+ic3iJTzQ8Eu3TdM14SawnVUmGE6A==
+ 
+ escalade@^3.1.1:
+-  version "3.1.1"
+-  resolved "https://registry.yarnpkg.com/escalade/-/escalade-3.1.1.tgz#d8cfdc7000965c5a0174b4a82eaa5c0552742e40"
+-  integrity sha512-k0er2gUkLf8O0zKJiAhmkTnJlTvINGv7ygDNPbeIsX/TJjGJZHuh9B2UxbsaEkmlEo9MfhrSzmhIlhRlI2GXnw==
++  version "3.2.0"
++  resolved "https://registry.npmjs.org/escalade/-/escalade-3.2.0.tgz"
++  integrity sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==
+ 
+ escape-string-regexp@4.0.0:
+   version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/escape-string-regexp/-/escape-string-regexp-4.0.0.tgz#14ba83a5d373e3d311e5afca29cf5bfad965bf34"
++  resolved "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-4.0.0.tgz"
+   integrity sha512-TtpcNJ3XAzx3Gq8sWRzJaVajRs0uVxA2YAkdb1jm2YkPz4G6egUFAyA3n5vtEIZefPk5Wa4UXbKuS5fKkJWdgA==
+ 
+-fill-range@^7.0.1:
+-  version "7.0.1"
+-  resolved "https://registry.yarnpkg.com/fill-range/-/fill-range-7.0.1.tgz#1919a6a7c75fe38b2c7c77e5198535da9acdda40"
+-  integrity sha512-qOo9F+dMUmC2Lcb4BbVvnKJxTPjCm+RRpe4gDuGrzkL7mEVl/djYSu2OdQ2Pa302N4oqkSg9ir6jaLWJ2USVpQ==
++fill-range@^7.1.1:
++  version "7.1.1"
++  resolved "https://registry.npmjs.org/fill-range/-/fill-range-7.1.1.tgz"
++  integrity sha512-YsGpe3WHLK8ZYi4tWDg2Jy3ebRz2rXowDxnld4bkQB00cc/1Zw9AWnC0i9ztDJitivtQvaI9KaLyKrc+hBW0yg==
+   dependencies:
+     to-regex-range "^5.0.1"
+ 
+ find-up@5.0.0:
+   version "5.0.0"
+-  resolved "https://registry.yarnpkg.com/find-up/-/find-up-5.0.0.tgz#4c92819ecb7083561e4f4a240a86be5198f536fc"
++  resolved "https://registry.npmjs.org/find-up/-/find-up-5.0.0.tgz"
+   integrity sha512-78/PXT1wlLLDgTzDs7sjq9hzz0vXD+zn+7wypEe4fXQxCmdmqfGsEPQxmiCSQI3ajFV91bVSsvNtrJRiW6nGng==
+   dependencies:
+     locate-path "^6.0.0"
+@@ -185,34 +190,34 @@
+ 
+ flat@^5.0.2:
+   version "5.0.2"
+-  resolved "https://registry.yarnpkg.com/flat/-/flat-5.0.2.tgz#8ca6fe332069ffa9d324c327198c598259ceb241"
++  resolved "https://registry.npmjs.org/flat/-/flat-5.0.2.tgz"
+   integrity sha512-b6suED+5/3rTpUBdG1gupIl8MPFCAMA0QXwmljLhvCUKcUvdE4gWky9zpuGCcXHOsz4J9wPGNWq6OKpmIzz3hQ==
+ 
+ fs.realpath@^1.0.0:
+   version "1.0.0"
+-  resolved "https://registry.yarnpkg.com/fs.realpath/-/fs.realpath-1.0.0.tgz#1504ad2523158caa40db4a2787cb01411994ea4f"
+-  integrity sha1-FQStJSMVjKpA20onh8sBQRmU6k8=
++  resolved "https://registry.npmjs.org/fs.realpath/-/fs.realpath-1.0.0.tgz"
++  integrity sha512-OO0pH2lK6a0hZnAdau5ItzHPI6pUlvI7jMVnxUQRtw4owF2wk8lOSabtGDCTP4Ggrg2MbGnWO9X8K1t4+fGMDw==
+ 
+ fsevents@~2.3.2:
+-  version "2.3.2"
+-  resolved "https://registry.yarnpkg.com/fsevents/-/fsevents-2.3.2.tgz#8a526f78b8fdf4623b709e0b975c52c24c02fd1a"
+-  integrity sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==
++  version "2.3.3"
++  resolved "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz"
++  integrity sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==
+ 
+ get-caller-file@^2.0.5:
+   version "2.0.5"
+-  resolved "https://registry.yarnpkg.com/get-caller-file/-/get-caller-file-2.0.5.tgz#4f94412a82db32f36e3b0b9741f8a97feb031f7e"
++  resolved "https://registry.npmjs.org/get-caller-file/-/get-caller-file-2.0.5.tgz"
+   integrity sha512-DyFP3BM/3YHTQOCUL/w0OZHR0lpKeGrxotcHWcqNEdnltqFwXVfhEBQ94eIo34AfQpo0rGki4cyIiftY06h2Fg==
+ 
+ glob-parent@~5.1.2:
+   version "5.1.2"
+-  resolved "https://registry.yarnpkg.com/glob-parent/-/glob-parent-5.1.2.tgz#869832c58034fe68a4093c17dc15e8340d8401c4"
++  resolved "https://registry.npmjs.org/glob-parent/-/glob-parent-5.1.2.tgz"
+   integrity sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==
+   dependencies:
+     is-glob "^4.0.1"
+ 
+ glob@7.2.0:
+   version "7.2.0"
+-  resolved "https://registry.yarnpkg.com/glob/-/glob-7.2.0.tgz#d15535af7732e02e948f4c41628bd910293f6023"
++  resolved "https://registry.npmjs.org/glob/-/glob-7.2.0.tgz"
+   integrity sha512-lmLf6gtyrPq8tTjSmrO94wBeQbFR3HbLHbuyD69wuyQkImp2hWqMGB47OX65FBkPffO641IP9jWa1z4ivqG26Q==
+   dependencies:
+     fs.realpath "^1.0.0"
+@@ -224,123 +229,116 @@
+ 
+ growl@1.10.5:
+   version "1.10.5"
+-  resolved "https://registry.yarnpkg.com/growl/-/growl-1.10.5.tgz#f2735dc2283674fa67478b10181059355c369e5e"
++  resolved "https://registry.npmjs.org/growl/-/growl-1.10.5.tgz"
+   integrity sha512-qBr4OuELkhPenW6goKVXiv47US3clb3/IbuWF9KNKEijAy9oeHxU9IgzjvJhHkUzhaj7rOUD7+YGWqUjLp5oSA==
+ 
+ has-flag@^4.0.0:
+   version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/has-flag/-/has-flag-4.0.0.tgz#944771fd9c81c81265c4d6941860da06bb59479b"
++  resolved "https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz"
+   integrity sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==
+ 
+ he@1.2.0:
+   version "1.2.0"
+-  resolved "https://registry.yarnpkg.com/he/-/he-1.2.0.tgz#84ae65fa7eafb165fddb61566ae14baf05664f0f"
++  resolved "https://registry.npmjs.org/he/-/he-1.2.0.tgz"
+   integrity sha512-F/1DnUGPopORZi0ni+CvrCgHQ5FyEAHRLSApuYWMmrbSwoN2Mn/7k+Gl38gJnR7yyDZk6WLXwiGod1JOWNDKGw==
+ 
+ inflight@^1.0.4:
+   version "1.0.6"
+-  resolved "https://registry.yarnpkg.com/inflight/-/inflight-1.0.6.tgz#49bd6331d7d02d0c09bc910a1075ba8165b56df9"
+-  integrity sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=
++  resolved "https://registry.npmjs.org/inflight/-/inflight-1.0.6.tgz"
++  integrity sha512-k92I/b08q4wvFscXCLvqfsHCrjrF7yiXsQuIVvVE7N82W3+aqpzuUdBbfhWcy/FZR3/4IgflMgKLOsvPDrGCJA==
+   dependencies:
+     once "^1.3.0"
+     wrappy "1"
+ 
+ inherits@2:
+   version "2.0.4"
+-  resolved "https://registry.yarnpkg.com/inherits/-/inherits-2.0.4.tgz#0fa2c64f932917c3433a0ded55363aae37416b7c"
++  resolved "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz"
+   integrity sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==
+ 
+ is-binary-path@~2.1.0:
+   version "2.1.0"
+-  resolved "https://registry.yarnpkg.com/is-binary-path/-/is-binary-path-2.1.0.tgz#ea1f7f3b80f064236e83470f86c09c254fb45b09"
++  resolved "https://registry.npmjs.org/is-binary-path/-/is-binary-path-2.1.0.tgz"
+   integrity sha512-ZMERYes6pDydyuGidse7OsHxtbI7WVeUEozgR/g7rd0xUimYNlvZRE/K2MgZTjWy725IfelLeVcEM97mmtRGXw==
+   dependencies:
+     binary-extensions "^2.0.0"
+ 
+ is-extglob@^2.1.1:
+   version "2.1.1"
+-  resolved "https://registry.yarnpkg.com/is-extglob/-/is-extglob-2.1.1.tgz#a88c02535791f02ed37c76a1b9ea9773c833f8c2"
+-  integrity sha1-qIwCU1eR8C7TfHahueqXc8gz+MI=
++  resolved "https://registry.npmjs.org/is-extglob/-/is-extglob-2.1.1.tgz"
++  integrity sha512-SbKbANkN603Vi4jEZv49LeVJMn4yGwsbzZworEoyEiutsN3nJYdbO36zfhGJ6QEDpOZIFkDtnq5JRxmvl3jsoQ==
+ 
+ is-fullwidth-code-point@^3.0.0:
+   version "3.0.0"
+-  resolved "https://registry.yarnpkg.com/is-fullwidth-code-point/-/is-fullwidth-code-point-3.0.0.tgz#f116f8064fe90b3f7844a38997c0b75051269f1d"
++  resolved "https://registry.npmjs.org/is-fullwidth-code-point/-/is-fullwidth-code-point-3.0.0.tgz"
+   integrity sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg==
+ 
+ is-glob@^4.0.1, is-glob@~4.0.1:
+   version "4.0.3"
+-  resolved "https://registry.yarnpkg.com/is-glob/-/is-glob-4.0.3.tgz#64f61e42cbbb2eec2071a9dac0b28ba1e65d5084"
++  resolved "https://registry.npmjs.org/is-glob/-/is-glob-4.0.3.tgz"
+   integrity sha512-xelSayHH36ZgE7ZWhli7pW34hNbNl8Ojv5KVmkJD4hBdD3th8Tfk9vYasLM+mXWOZhFkgZfxhLSnrwRr4elSSg==
+   dependencies:
+     is-extglob "^2.1.1"
+ 
+ is-number@^7.0.0:
+   version "7.0.0"
+-  resolved "https://registry.yarnpkg.com/is-number/-/is-number-7.0.0.tgz#7535345b896734d5f80c4d06c50955527a14f12b"
++  resolved "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz"
+   integrity sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==
+ 
+ is-plain-obj@^2.1.0:
+   version "2.1.0"
+-  resolved "https://registry.yarnpkg.com/is-plain-obj/-/is-plain-obj-2.1.0.tgz#45e42e37fccf1f40da8e5f76ee21515840c09287"
++  resolved "https://registry.npmjs.org/is-plain-obj/-/is-plain-obj-2.1.0.tgz"
+   integrity sha512-YWnfyRwxL/+SsrWYfOpUtz5b3YD+nyfkHvjbcanzk8zgyO4ASD67uVMRt8k5bM4lLMDnXfriRhOpemw+NfT1eA==
+ 
+ is-unicode-supported@^0.1.0:
+   version "0.1.0"
+-  resolved "https://registry.yarnpkg.com/is-unicode-supported/-/is-unicode-supported-0.1.0.tgz#3f26c76a809593b52bfa2ecb5710ed2779b522a7"
++  resolved "https://registry.npmjs.org/is-unicode-supported/-/is-unicode-supported-0.1.0.tgz"
+   integrity sha512-knxG2q4UC3u8stRGyAVJCOdxFmv5DZiRcdlIaAQXAbSfJya+OhopNotLQrstBhququ4ZpuKbDc/8S6mgXgPFPw==
+ 
+ isexe@^2.0.0:
+   version "2.0.0"
+-  resolved "https://registry.yarnpkg.com/isexe/-/isexe-2.0.0.tgz#e8fbf374dc556ff8947a10dcb0572d633f2cfa10"
+-  integrity sha1-6PvzdNxVb/iUehDcsFctYz8s+hA=
++  resolved "https://registry.npmjs.org/isexe/-/isexe-2.0.0.tgz"
++  integrity sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==
+ 
+ js-yaml@4.1.0:
+   version "4.1.0"
+-  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-4.1.0.tgz#c1fb65f8f5017901cdd2c951864ba18458a10602"
++  resolved "https://registry.npmjs.org/js-yaml/-/js-yaml-4.1.0.tgz"
+   integrity sha512-wpxZs9NoxZaJESJGIZTyDEaYpl0FKSA+FB9aJiyemKhMwkxQg63h4T1KJgUGHpTqPDNRcmmYLugrRjJlBtWvRA==
+   dependencies:
+     argparse "^2.0.1"
+ 
+ locate-path@^6.0.0:
+   version "6.0.0"
+-  resolved "https://registry.yarnpkg.com/locate-path/-/locate-path-6.0.0.tgz#55321eb309febbc59c4801d931a72452a681d286"
++  resolved "https://registry.npmjs.org/locate-path/-/locate-path-6.0.0.tgz"
+   integrity sha512-iPZK6eYjbxRu3uB4/WZ3EsEIMJFMqAoopl3R+zuq0UjcAm/MO6KCweDgPfP3elTztoKP3KtnVHxTn2NHBSDVUw==
+   dependencies:
+     p-locate "^5.0.0"
+ 
+ log-symbols@4.1.0:
+   version "4.1.0"
+-  resolved "https://registry.yarnpkg.com/log-symbols/-/log-symbols-4.1.0.tgz#3fbdbb95b4683ac9fc785111e792e558d4abd503"
++  resolved "https://registry.npmjs.org/log-symbols/-/log-symbols-4.1.0.tgz"
+   integrity sha512-8XPvpAA8uyhfteu8pIvQxpJZ7SYYdpUivZpGy6sFsBuKRY/7rQGavedeB8aK+Zkyq6upMFVL/9AW6vOYzfRyLg==
+   dependencies:
+     chalk "^4.1.0"
+     is-unicode-supported "^0.1.0"
+ 
+-lru-cache@^6.0.0:
+-  version "6.0.0"
+-  resolved "https://registry.yarnpkg.com/lru-cache/-/lru-cache-6.0.0.tgz#6d6fe6570ebd96aaf90fcad1dafa3b2566db3a94"
+-  integrity sha512-Jo6dJ04CmSjuznwJSS3pUeWmd/H0ffTlkXXgwZi+eq1UCmqQwCh+eLsYOYCwY991i2Fah4h1BEMCx4qThGbsiA==
+-  dependencies:
+-    yallist "^4.0.0"
+-
+-minimatch@3.0.4:
+-  version "3.0.4"
+-  resolved "https://registry.yarnpkg.com/minimatch/-/minimatch-3.0.4.tgz#5166e286457f03306064be5497e8dbb0c3d32083"
+-  integrity sha512-yJHVQEhyqPLUTgt9B83PXu6W3rx4MvvHvSUvToogpwoGDOUQ+yDrR0HRot+yOCdCO7u4hX3pWft6kWBBcqh0UA==
+-  dependencies:
+-    brace-expansion "^1.1.7"
+-
+ minimatch@^3.0.4:
+   version "3.1.2"
+-  resolved "https://registry.yarnpkg.com/minimatch/-/minimatch-3.1.2.tgz#19cd194bfd3e428f049a70817c038d89ab4be35b"
++  resolved "https://registry.npmjs.org/minimatch/-/minimatch-3.1.2.tgz"
+   integrity sha512-J7p63hRiAjw1NDEww1W7i37+ByIrOWO5XQQAzZ3VOcL0PNybwpfmV/N05zFAzwQ9USyEcX6t3UO+K5aqBQOIHw==
+   dependencies:
+     brace-expansion "^1.1.7"
+ 
++minimatch@4.2.1:
++  version "4.2.1"
++  resolved "https://registry.npmjs.org/minimatch/-/minimatch-4.2.1.tgz"
++  integrity sha512-9Uq1ChtSZO+Mxa/CL1eGizn2vRn3MlLgzhT0Iz8zaY8NdvxvB0d5QdPFmCKf7JKA9Lerx5vRrnwO03jsSfGG9g==
++  dependencies:
++    brace-expansion "^1.1.7"
++
+ mocha@^9.2.1:
+-  version "9.2.1"
+-  resolved "https://registry.yarnpkg.com/mocha/-/mocha-9.2.1.tgz#a1abb675aa9a8490798503af57e8782a78f1338e"
+-  integrity sha512-T7uscqjJVS46Pq1XDXyo9Uvey9gd3huT/DD9cYBb4K2Xc/vbKRPUWK067bxDQRK0yIz6Jxk73IrnimvASzBNAQ==
++  version "9.2.2"
++  resolved "https://registry.npmjs.org/mocha/-/mocha-9.2.2.tgz"
++  integrity sha512-L6XC3EdwT6YrIk0yXpavvLkn8h+EU+Y5UcCHKECyMbdUIxyMuZj4bX4U9e1nvnvUUvQVsV2VHQr5zLdcUkhW/g==
+   dependencies:
+     "@ungap/promise-all-settled" "1.1.2"
+     ansi-colors "4.1.1"
+@@ -355,9 +353,9 @@
+     he "1.2.0"
+     js-yaml "4.1.0"
+     log-symbols "4.1.0"
+-    minimatch "3.0.4"
++    minimatch "4.2.1"
+     ms "2.1.3"
+-    nanoid "3.2.0"
++    nanoid "3.3.1"
+     serialize-javascript "6.0.0"
+     strip-json-comments "3.1.1"
+     supports-color "8.1.1"
+@@ -369,101 +367,99 @@
+ 
+ ms@2.1.2:
+   version "2.1.2"
+-  resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.2.tgz#d09d1f357b443f493382a8eb3ccd183872ae6009"
++  resolved "https://registry.npmjs.org/ms/-/ms-2.1.2.tgz"
+   integrity sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==
+ 
+ ms@2.1.3:
+   version "2.1.3"
+-  resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.3.tgz#574c8138ce1d2b5861f0b44579dbadd60c6615b2"
++  resolved "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+   integrity sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==
+ 
+-nanoid@3.2.0:
+-  version "3.2.0"
+-  resolved "https://registry.yarnpkg.com/nanoid/-/nanoid-3.2.0.tgz#62667522da6673971cca916a6d3eff3f415ff80c"
+-  integrity sha512-fmsZYa9lpn69Ad5eDn7FMcnnSR+8R34W9qJEijxYhTbfOWzr22n1QxCMzXLK+ODyW2973V3Fux959iQoUxzUIA==
++nanoid@3.3.1:
++  version "3.3.1"
++  resolved "https://registry.npmjs.org/nanoid/-/nanoid-3.3.1.tgz"
++  integrity sha512-n6Vs/3KGyxPQd6uO0eH4Bv0ojGSUvuLlIHtC3Y0kEO23YRge8H9x1GCzLn28YX0H66pMkxuaeESFq4tKISKwdw==
+ 
+ normalize-path@^3.0.0, normalize-path@~3.0.0:
+   version "3.0.0"
+-  resolved "https://registry.yarnpkg.com/normalize-path/-/normalize-path-3.0.0.tgz#0dcd69ff23a1c9b11fd0978316644a0388216a65"
++  resolved "https://registry.npmjs.org/normalize-path/-/normalize-path-3.0.0.tgz"
+   integrity sha512-6eZs5Ls3WtCisHWp9S2GUy8dqkpGi4BVSz3GaqiE6ezub0512ESztXUwUB6C6IKbQkY2Pnb/mD4WYojCRwcwLA==
+ 
+ once@^1.3.0:
+   version "1.4.0"
+-  resolved "https://registry.yarnpkg.com/once/-/once-1.4.0.tgz#583b1aa775961d4b113ac17d9c50baef9dd76bd1"
+-  integrity sha1-WDsap3WWHUsROsF9nFC6753Xa9E=
++  resolved "https://registry.npmjs.org/once/-/once-1.4.0.tgz"
++  integrity sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==
+   dependencies:
+     wrappy "1"
+ 
+ p-limit@^3.0.2:
+   version "3.1.0"
+-  resolved "https://registry.yarnpkg.com/p-limit/-/p-limit-3.1.0.tgz#e1daccbe78d0d1388ca18c64fea38e3e57e3706b"
++  resolved "https://registry.npmjs.org/p-limit/-/p-limit-3.1.0.tgz"
+   integrity sha512-TYOanM3wGwNGsZN2cVTYPArw454xnXj5qmWF1bEoAc4+cU/ol7GVh7odevjp1FNHduHc3KZMcFduxU5Xc6uJRQ==
+   dependencies:
+     yocto-queue "^0.1.0"
+ 
+ p-locate@^5.0.0:
+   version "5.0.0"
+-  resolved "https://registry.yarnpkg.com/p-locate/-/p-locate-5.0.0.tgz#83c8315c6785005e3bd021839411c9e110e6d834"
++  resolved "https://registry.npmjs.org/p-locate/-/p-locate-5.0.0.tgz"
+   integrity sha512-LaNjtRWUBY++zB5nE/NwcaoMylSPk+S+ZHNB1TzdbMJMny6dynpAGt7X/tl/QYq3TIeE6nxHppbo2LGymrG5Pw==
+   dependencies:
+     p-limit "^3.0.2"
+ 
+ path-exists@^4.0.0:
+   version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/path-exists/-/path-exists-4.0.0.tgz#513bdbe2d3b95d7762e8c1137efa195c6c61b5b3"
++  resolved "https://registry.npmjs.org/path-exists/-/path-exists-4.0.0.tgz"
+   integrity sha512-ak9Qy5Q7jYb2Wwcey5Fpvg2KoAc/ZIhLSLOSBmRmygPsGwkVVt0fZa0qrtMz+m6tJTAHfZQ8FnmB4MG4LWy7/w==
+ 
+ path-is-absolute@^1.0.0:
+   version "1.0.1"
+-  resolved "https://registry.yarnpkg.com/path-is-absolute/-/path-is-absolute-1.0.1.tgz#174b9268735534ffbc7ace6bf53a5a9e1b5c5f5f"
+-  integrity sha1-F0uSaHNVNP+8es5r9TpanhtcX18=
++  resolved "https://registry.npmjs.org/path-is-absolute/-/path-is-absolute-1.0.1.tgz"
++  integrity sha512-AVbw3UJ2e9bq64vSaS9Am0fje1Pa8pbGqTTsmXfaIiMpnr5DlDhfJOuLj9Sf95ZPVDAUerDfEk88MPmPe7UCQg==
+ 
+ picomatch@^2.0.4, picomatch@^2.2.1:
+   version "2.3.1"
+-  resolved "https://registry.yarnpkg.com/picomatch/-/picomatch-2.3.1.tgz#3ba3833733646d9d3e4995946c1365a67fb07a42"
++  resolved "https://registry.npmjs.org/picomatch/-/picomatch-2.3.1.tgz"
+   integrity sha512-JU3teHTNjmE2VCGFzuY8EXzCDVwEqB2a8fsIvwaStHhAWJEeVd1o1QD80CU6+ZdEXXSLbSsuLwJjkCBWqRQUVA==
+ 
+ randombytes@^2.1.0:
+   version "2.1.0"
+-  resolved "https://registry.yarnpkg.com/randombytes/-/randombytes-2.1.0.tgz#df6f84372f0270dc65cdf6291349ab7a473d4f2a"
++  resolved "https://registry.npmjs.org/randombytes/-/randombytes-2.1.0.tgz"
+   integrity sha512-vYl3iOX+4CKUWuxGi9Ukhie6fsqXqS9FE2Zaic4tNFD2N2QQaXOMFbuKK4QmDHC0JO6B1Zp41J0LpT0oR68amQ==
+   dependencies:
+     safe-buffer "^5.1.0"
+ 
+ readdirp@~3.6.0:
+   version "3.6.0"
+-  resolved "https://registry.yarnpkg.com/readdirp/-/readdirp-3.6.0.tgz#74a370bd857116e245b29cc97340cd431a02a6c7"
++  resolved "https://registry.npmjs.org/readdirp/-/readdirp-3.6.0.tgz"
+   integrity sha512-hOS089on8RduqdbhvQ5Z37A0ESjsqz6qnRcffsMU3495FuTdqSm+7bhJ29JvIOsBDEEnan5DPu9t3To9VRlMzA==
+   dependencies:
+     picomatch "^2.2.1"
+ 
+ require-directory@^2.1.1:
+   version "2.1.1"
+-  resolved "https://registry.yarnpkg.com/require-directory/-/require-directory-2.1.1.tgz#8c64ad5fd30dab1c976e2344ffe7f792a6a6df42"
+-  integrity sha1-jGStX9MNqxyXbiNE/+f3kqam30I=
++  resolved "https://registry.npmjs.org/require-directory/-/require-directory-2.1.1.tgz"
++  integrity sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q==
+ 
+ safe-buffer@^5.1.0:
+   version "5.2.1"
+-  resolved "https://registry.yarnpkg.com/safe-buffer/-/safe-buffer-5.2.1.tgz#1eaf9fa9bdb1fdd4ec75f58f9cdb4e6b7827eec6"
++  resolved "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz"
+   integrity sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==
+ 
+ semver@^7.3.4:
+-  version "7.3.5"
+-  resolved "https://registry.yarnpkg.com/semver/-/semver-7.3.5.tgz#0b621c879348d8998e4b0e4be94b3f12e6018ef7"
+-  integrity sha512-PoeGJYh8HK4BTO/a9Tf6ZG3veo/A7ZVsYrSA6J8ny9nb3B1VrpkuN+z9OE5wfE5p6H4LchYZsegiQgbJD94ZFQ==
+-  dependencies:
+-    lru-cache "^6.0.0"
++  version "7.7.2"
++  resolved "https://registry.npmjs.org/semver/-/semver-7.7.2.tgz"
++  integrity sha512-RF0Fw+rO5AMf9MAyaRXI4AV0Ulj5lMHqVxxdSgiVbixSCXoEmmX/jk0CuJw4+3SqroYO9VoUh+HcuJivvtJemA==
+ 
+ serialize-javascript@6.0.0:
+   version "6.0.0"
+-  resolved "https://registry.yarnpkg.com/serialize-javascript/-/serialize-javascript-6.0.0.tgz#efae5d88f45d7924141da8b5c3a7a7e663fefeb8"
++  resolved "https://registry.npmjs.org/serialize-javascript/-/serialize-javascript-6.0.0.tgz"
+   integrity sha512-Qr3TosvguFt8ePWqsvRfrKyQXIiW+nGbYpy8XK24NQHE83caxWt+mIymTT19DGFbNWNLfEwsrkSmN64lVWB9ag==
+   dependencies:
+     randombytes "^2.1.0"
+ 
+ string-width@^4.1.0, string-width@^4.2.0:
+   version "4.2.3"
+-  resolved "https://registry.yarnpkg.com/string-width/-/string-width-4.2.3.tgz#269c7117d27b05ad2e536830a8ec895ef9c6d010"
++  resolved "https://registry.npmjs.org/string-width/-/string-width-4.2.3.tgz"
+   integrity sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g==
+   dependencies:
+     emoji-regex "^8.0.0"
+@@ -472,50 +468,50 @@
+ 
+ strip-ansi@^6.0.0, strip-ansi@^6.0.1:
+   version "6.0.1"
+-  resolved "https://registry.yarnpkg.com/strip-ansi/-/strip-ansi-6.0.1.tgz#9e26c63d30f53443e9489495b2105d37b67a85d9"
++  resolved "https://registry.npmjs.org/strip-ansi/-/strip-ansi-6.0.1.tgz"
+   integrity sha512-Y38VPSHcqkFrCpFnQ9vuSXmquuv5oXOKpGeT6aGrr3o3Gc9AlVa6JBfUSOCnbxGGZF+/0ooI7KrPuUSztUdU5A==
+   dependencies:
+     ansi-regex "^5.0.1"
+ 
+ strip-json-comments@3.1.1:
+   version "3.1.1"
+-  resolved "https://registry.yarnpkg.com/strip-json-comments/-/strip-json-comments-3.1.1.tgz#31f1281b3832630434831c310c01cccda8cbe006"
++  resolved "https://registry.npmjs.org/strip-json-comments/-/strip-json-comments-3.1.1.tgz"
+   integrity sha512-6fPc+R4ihwqP6N/aIv2f1gMH8lOVtWQHoqC4yK6oSDVVocumAsfCqjkXnqiYMhmMwS/mEHLp7Vehlt3ql6lEig==
+ 
++supports-color@^7.1.0:
++  version "7.2.0"
++  resolved "https://registry.npmjs.org/supports-color/-/supports-color-7.2.0.tgz"
++  integrity sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==
++  dependencies:
++    has-flag "^4.0.0"
++
+ supports-color@8.1.1:
+   version "8.1.1"
+-  resolved "https://registry.yarnpkg.com/supports-color/-/supports-color-8.1.1.tgz#cd6fc17e28500cff56c1b86c0a7fd4a54a73005c"
++  resolved "https://registry.npmjs.org/supports-color/-/supports-color-8.1.1.tgz"
+   integrity sha512-MpUEN2OodtUzxvKQl72cUF7RQ5EiHsGvSsVG0ia9c5RbWGL2CI4C7EpPS8UTBIplnlzZiNuV56w+FuNxy3ty2Q==
+   dependencies:
+     has-flag "^4.0.0"
+ 
+-supports-color@^7.1.0:
+-  version "7.2.0"
+-  resolved "https://registry.yarnpkg.com/supports-color/-/supports-color-7.2.0.tgz#1b7dcdcb32b8138801b3e478ba6a51caa89648da"
+-  integrity sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==
+-  dependencies:
+-    has-flag "^4.0.0"
+-
+ to-regex-range@^5.0.1:
+   version "5.0.1"
+-  resolved "https://registry.yarnpkg.com/to-regex-range/-/to-regex-range-5.0.1.tgz#1648c44aae7c8d988a326018ed72f5b4dd0392e4"
++  resolved "https://registry.npmjs.org/to-regex-range/-/to-regex-range-5.0.1.tgz"
+   integrity sha512-65P7iz6X5yEr1cwcgvQxbbIw7Uk3gOy5dIdtZ4rDveLqhrdJP+Li/Hx6tyK0NEb+2GCyneCMJiGqrADCSNk8sQ==
+   dependencies:
+     is-number "^7.0.0"
+ 
+ typescript@^4.5.5:
+-  version "4.6.2"
+-  resolved "https://registry.yarnpkg.com/typescript/-/typescript-4.6.2.tgz#fe12d2727b708f4eef40f51598b3398baa9611d4"
+-  integrity sha512-HM/hFigTBHZhLXshn9sN37H085+hQGeJHJ/X7LpBWLID/fbc2acUMfU+lGD98X81sKP+pFa9f0DZmCwB9GnbAg==
++  version "4.9.5"
++  resolved "https://registry.npmjs.org/typescript/-/typescript-4.9.5.tgz"
++  integrity sha512-1FXk9E2Hm+QzZQ7z+McJiHL4NW1F2EzMu9Nq9i3zAaGqibafqYwCVU6WyWAuyQRRzOlxou8xZSyXLEN8oKj24g==
+ 
+ vscode-jsonrpc@6.0.0:
+   version "6.0.0"
+-  resolved "https://registry.yarnpkg.com/vscode-jsonrpc/-/vscode-jsonrpc-6.0.0.tgz#108bdb09b4400705176b957ceca9e0880e9b6d4e"
++  resolved "https://registry.npmjs.org/vscode-jsonrpc/-/vscode-jsonrpc-6.0.0.tgz"
+   integrity sha512-wnJA4BnEjOSyFMvjZdpiOwhSq9uDoK8e/kpRJDTaMYzwlkrhG1fwDIZI94CLsLzlCK5cIbMMtFlJlfR57Lavmg==
+ 
+ vscode-languageclient@~7.0.0:
+   version "7.0.0"
+-  resolved "https://registry.yarnpkg.com/vscode-languageclient/-/vscode-languageclient-7.0.0.tgz#b505c22c21ffcf96e167799757fca07a6bad0fb2"
++  resolved "https://registry.npmjs.org/vscode-languageclient/-/vscode-languageclient-7.0.0.tgz"
+   integrity sha512-P9AXdAPlsCgslpP9pRxYPqkNYV7Xq8300/aZDpO35j1fJm/ncize8iGswzYlcvFw5DQUx4eVk+KvfXdL0rehNg==
+   dependencies:
+     minimatch "^3.0.4"
+@@ -524,32 +520,32 @@
+ 
+ vscode-languageserver-protocol@3.16.0:
+   version "3.16.0"
+-  resolved "https://registry.yarnpkg.com/vscode-languageserver-protocol/-/vscode-languageserver-protocol-3.16.0.tgz#34135b61a9091db972188a07d337406a3cdbe821"
++  resolved "https://registry.npmjs.org/vscode-languageserver-protocol/-/vscode-languageserver-protocol-3.16.0.tgz"
+   integrity sha512-sdeUoAawceQdgIfTI+sdcwkiK2KU+2cbEYA0agzM2uqaUy2UpnnGHtWTHVEtS0ES4zHU0eMFRGN+oQgDxlD66A==
+   dependencies:
+     vscode-jsonrpc "6.0.0"
+     vscode-languageserver-types "3.16.0"
+ 
+-vscode-languageserver-types@3.16.0, vscode-languageserver-types@~3.16.0:
++vscode-languageserver-types@~3.16.0, vscode-languageserver-types@3.16.0:
+   version "3.16.0"
+-  resolved "https://registry.yarnpkg.com/vscode-languageserver-types/-/vscode-languageserver-types-3.16.0.tgz#ecf393fc121ec6974b2da3efb3155644c514e247"
++  resolved "https://registry.npmjs.org/vscode-languageserver-types/-/vscode-languageserver-types-3.16.0.tgz"
+   integrity sha512-k8luDIWJWyenLc5ToFQQMaSrqCHiLwyKPHKPQZ5zz21vM+vIVUSvsRpcbiECH4WR88K2XZqc4ScRcZ7nk/jbeA==
+ 
+ which@2.0.2:
+   version "2.0.2"
+-  resolved "https://registry.yarnpkg.com/which/-/which-2.0.2.tgz#7c6a8dd0a636a0327e10b59c9286eee93f3f51b1"
++  resolved "https://registry.npmjs.org/which/-/which-2.0.2.tgz"
+   integrity sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==
+   dependencies:
+     isexe "^2.0.0"
+ 
+ workerpool@6.2.0:
+   version "6.2.0"
+-  resolved "https://registry.yarnpkg.com/workerpool/-/workerpool-6.2.0.tgz#827d93c9ba23ee2019c3ffaff5c27fccea289e8b"
++  resolved "https://registry.npmjs.org/workerpool/-/workerpool-6.2.0.tgz"
+   integrity sha512-Rsk5qQHJ9eowMH28Jwhe8HEbmdYDX4lwoMWshiCXugjtHqMD9ZbiqSDLxcsfdqsETPzVUtX5s1Z5kStiIM6l4A==
+ 
+ wrap-ansi@^7.0.0:
+   version "7.0.0"
+-  resolved "https://registry.yarnpkg.com/wrap-ansi/-/wrap-ansi-7.0.0.tgz#67e145cff510a6a6984bdf1152911d69d2eb9e43"
++  resolved "https://registry.npmjs.org/wrap-ansi/-/wrap-ansi-7.0.0.tgz"
+   integrity sha512-YVGIj2kamLSTxw6NsZjoBxfSwsn0ycdesmc4p+Q21c5zPuZ1pl+NfxVdxPtdHvmNVOQ6XSYG4AUtyt/Fi7D16Q==
+   dependencies:
+     ansi-styles "^4.0.0"
+@@ -558,32 +554,22 @@
+ 
+ wrappy@1:
+   version "1.0.2"
+-  resolved "https://registry.yarnpkg.com/wrappy/-/wrappy-1.0.2.tgz#b5243d8f3ec1aa35f1364605bc0d1036e30ab69f"
+-  integrity sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8=
++  resolved "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz"
++  integrity sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==
+ 
+ y18n@^5.0.5:
+   version "5.0.8"
+-  resolved "https://registry.yarnpkg.com/y18n/-/y18n-5.0.8.tgz#7f4934d0f7ca8c56f95314939ddcd2dd91ce1d55"
++  resolved "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz"
+   integrity sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA==
+ 
+-yallist@^4.0.0:
+-  version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/yallist/-/yallist-4.0.0.tgz#9bb92790d9c0effec63be73519e11a35019a3a72"
+-  integrity sha512-3wdGidZyq5PB084XLES5TpOSRA3wjXAlIWMhum2kRcv/41Sn2emQ0dycQW4uZXLejwKvg6EsvbdlVL+FYEct7A==
+-
+-yargs-parser@20.2.4:
++yargs-parser@^20.2.2, yargs-parser@20.2.4:
+   version "20.2.4"
+-  resolved "https://registry.yarnpkg.com/yargs-parser/-/yargs-parser-20.2.4.tgz#b42890f14566796f85ae8e3a25290d205f154a54"
++  resolved "https://registry.npmjs.org/yargs-parser/-/yargs-parser-20.2.4.tgz"
+   integrity sha512-WOkpgNhPTlE73h4VFAFsOnomJVaovO8VqLDzy5saChRBFQFBoMYirowyW+Q9HB4HFF4Z7VZTiG3iSzJJA29yRA==
+ 
+-yargs-parser@^20.2.2:
+-  version "20.2.9"
+-  resolved "https://registry.yarnpkg.com/yargs-parser/-/yargs-parser-20.2.9.tgz#2eb7dc3b0289718fc295f362753845c41a0c94ee"
+-  integrity sha512-y11nGElTIV+CT3Zv9t7VKl+Q3hTQoT9a1Qzezhhl6Rp21gJ/IVTW7Z3y9EWXhuUBC2Shnf+DX0antecpAwSP8w==
+-
+ yargs-unparser@2.0.0:
+   version "2.0.0"
+-  resolved "https://registry.yarnpkg.com/yargs-unparser/-/yargs-unparser-2.0.0.tgz#f131f9226911ae5d9ad38c432fe809366c2325eb"
++  resolved "https://registry.npmjs.org/yargs-unparser/-/yargs-unparser-2.0.0.tgz"
+   integrity sha512-7pRTIA9Qc1caZ0bZ6RYRGbHJthJWuakf+WmHK0rVeLkNrrGhfoabBNdue6kdINI6r4if7ocq9aD/n7xwKOdzOA==
+   dependencies:
+     camelcase "^6.0.0"
+@@ -593,7 +579,7 @@
+ 
+ yargs@16.2.0:
+   version "16.2.0"
+-  resolved "https://registry.yarnpkg.com/yargs/-/yargs-16.2.0.tgz#1c82bf0f6b6a66eafce7ef30e376f49a12477f66"
++  resolved "https://registry.npmjs.org/yargs/-/yargs-16.2.0.tgz"
+   integrity sha512-D1mvvtDG0L5ft/jGWkLpG1+m0eQxOfaBvTNELraWj22wSVUMWxZUvYgJYcKh6jGGIkJFhH4IZPQhR4TKpc8mBw==
+   dependencies:
+     cliui "^7.0.2"
+@@ -606,5 +592,5 @@
+ 
+ yocto-queue@^0.1.0:
+   version "0.1.0"
+-  resolved "https://registry.yarnpkg.com/yocto-queue/-/yocto-queue-0.1.0.tgz#0294eb3dee05028d31ee1a5fa2c556a6aaf10a1b"
++  resolved "https://registry.npmjs.org/yocto-queue/-/yocto-queue-0.1.0.tgz"
+   integrity sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==
+diff -r 7d6e6531de61 src/Tools/VSCode/src/language_server.scala
+--- a/src/Tools/VSCode/src/language_server.scala	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/src/language_server.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -487,11 +487,27 @@
+     channel.write(LSP.Symbols_Convert_Request.reply(id, converted))
+   }
+ 
++//  def log_try(input: String): Unit = {
++//    channel.writeln(s"language_server.scala: $input")
++//    val w = new java.io.PrintWriter(new java.io.FileOutputStream("/tmp/isabelle_backend_debug.log", /* append = */ true))
++//    w.write(s"language_server.scala: - $input\n")
++//    w.close()
++//  }
++
++  private object VSCode_Symbols {
++    def codepoints_from_component(): List[Int] = {
++      val from_codepoint = Component_VSCodium.symbols.entries.flatMap(_.code.toList)
++      val from_multi_codepoint_symbols =
++        Component_VSCodium.symbols.entries.flatMap(e => e.symbol.codePoints().toArray.toList)
++      (from_codepoint ++ from_multi_codepoint_symbols).distinct.sorted
++    }
++  }
+ 
+   /* main loop */
+ 
+   def start(): Unit = {
+     log("Server started " + Date.now())
++    VSCode_Metric_Manager.load_store()
+ 
+     def handle(json: JSON.T): Unit = {
+       try {
+@@ -525,10 +541,19 @@
+           case LSP.State_Update(state_id) => State_Panel.update(state_id)
+           case LSP.State_Auto_Update(state_id, enabled) =>
+             State_Panel.auto_update(state_id, enabled)
+-          case LSP.State_Set_Margin(state_id, margin) => State_Panel.set_margin(state_id, margin)
++          case LSP.State_Set_Margin(state_id, margin) =>
++            State_Panel.set_margin(state_id, margin)
+           case LSP.Symbols_Request(id) => symbols_request(id)
+           case LSP.Symbols_Convert_Request(id, text, boolean) =>
+             symbols_convert_request(id, text, boolean)
++          case LSP.Metric_Probe(fp) =>
++            VSCode_Metric_Manager.set_fingerprint_only(fp)
++            val need = VSCode_Metric_Manager.should_probe(fp)
++            val symbols = if (need) VSCode_Symbols.codepoints_from_component() else Nil
++            channel.write(LSP.Metric_Need(need, symbols))
++          case LSP.Metric_Set(fp, table) =>
++            val changed = VSCode_Metric_Manager.set(fp, table)
++            if (changed) VSCode_Metric_Manager.broadcast_reformat()
+           case LSP.Preview_Request(file, column) => preview_request(file, column)
+           case _ => if (!LSP.ResponseMessage.is_empty(json)) log("### IGNORED")
+         }
+diff -r 7d6e6531de61 src/Tools/VSCode/src/lsp.scala
+--- a/src/Tools/VSCode/src/lsp.scala	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/src/lsp.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -677,7 +677,6 @@
+       }
+   }
+ 
+-
+   /* symbols */
+ 
+   object Symbols_Request extends Request0("PIDE/symbols_request") {
+@@ -696,7 +695,7 @@
+       ResponseMessage(id, Some(symbols.entries.map(s => json(s))))
+     }
+   }
+-  
++
+   object Symbols_Convert_Request {
+     def unapply(json: JSON.T): Option[(Id, String, Boolean)] =
+       json match {
+@@ -712,6 +711,46 @@
+       ResponseMessage(id, Some(JSON.Object("text" -> new_string)))
+   }
+ 
++  /* save vscode metrics */
++
++  object Metric_Set {
++    def unapply(json: JSON.T): Option[(String, Map[Int, Double])] = json match {
++      case Notification("PIDE/metric_set", Some(params)) =>
++        def parsePair(x: JSON.T): Option[(Int, Double)] =
++          JSON.Value.List.unapply(x, (y: JSON.T) => Some(y)).flatMap {
++            case List(cp_j, w_j) =>
++              val cpOpt = cp_j match { case JSON.Value.Int(cp) => Some(cp); case _ => None }
++              val wOpt  = w_j match {
++                case JSON.Value.Double(w) => Some(w)
++                case JSON.Value.Int(n) => Some(n.toDouble)
++                case _ => None
++              }
++              for { cp <- cpOpt; w <- wOpt } yield (cp -> w)
++            case _ => None
++          }
++        for {
++          fp <- JSON.string(params, "fingerprint")
++          table <- JSON.array(params, "widthTable").map(_.flatMap(parsePair).toMap)
++        } yield (fp, table)
++      case _ => None
++    }
++  }
++
++  object Metric_Probe {
++    def unapply(json: JSON.T): Option[(String)] = json match {
++      case Notification("PIDE/metric_probe", Some(params)) =>
++        for {
++          fp <- JSON.string(params, "fingerprint")
++        } yield (fp)
++      case _ => None
++    }
++  }
++
++  object Metric_Need {
++    def apply(need: Boolean, symbols: List[Int]): JSON.T =
++      Notification("PIDE/metric_need",
++        JSON.Object("need" -> need, "symbols" -> symbols))
++  }
+ 
+   /* preview */
+ 
+diff -r 7d6e6531de61 src/Tools/VSCode/src/pretty_text_panel.scala
+--- a/src/Tools/VSCode/src/pretty_text_panel.scala	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/src/pretty_text_panel.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -33,16 +33,43 @@
+ 
+   def resources: VSCode_Resources = session.resources
+ 
+-  def update_margin(new_margin: Double): Unit = {
+-    margin = new_margin
+-    delay_margin.invoke()
++  def update_margin(m: Double): Unit = {
++    if (m != margin) {
++      channel.log_writeln(s"[Pretty_Text_Panel.update_margin] margin=$m")
++      margin = m
++      if (current_output != null) refresh(current_output)
++    }
++  }
++
++  def reformat(): Unit = if (current_output != null) {
++    channel.log_writeln(s"pretty_text_panel/refresh()")
++    refresh(current_output)
+   }
+ 
+   def refresh(output: List[XML.Elem]): Unit = {
++    val metric = VSCode_Metric_Manager.current_metric_or_default()
++    val LOG_LINE_BREAKS = true
++    val LOG_SYMBOL_WIDTHS_TO_FILE = true
++
+     val formatted =
+-      Pretty.formatted(Pretty.separate(output), margin = margin, metric = Symbol.Metric)
++      Pretty.formatted(Pretty.separate(output), margin = margin, breakgain = margin/20, metric = metric)
+ 
+     if (formatted != current_formatted) {
++      if (LOG_SYMBOL_WIDTHS_TO_FILE) {
++        VSCode_Metric_Dump.dump(metric, channel)
++      }
++
++      channel.log_writeln(s"[Metric] unit = ${metric.unit}")
++      channel.log_writeln(s"[Metric] '⋀'   = ${metric("⋀")}")
++      channel.log_writeln(s"[Metric] '⟹' = ${metric("⟹")}")
++
++      if (LOG_LINE_BREAKS) {
++        val pretty_text: String = Pretty.output_content(pure = false, formatted)
++        val pretty_lines: Int =
++          if (pretty_text.isEmpty) 0 else pretty_text.count(_ == '\n') + 1
++        channel.log_writeln(s"[Pretty_Text_Panel Metrics] from xml: linebreaks=$pretty_lines")
++      }
++
+       val message = {
+         if (resources.html_output) {
+           val node_context =
+@@ -86,3 +113,42 @@
+     }
+   }
+ }
++
++private object VSCode_Metric_Dump {
++  private val seen = new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]()
++
++  private val sigChars: List[String] =
++    List("⋀", "⟹")
++
++
++  private def signature(metric: isabelle.Pretty.Metric): String = {
++    val parts =
++      sigChars.map(ch => f"${metric(ch)}%.4f") :+ f"unit=${metric.unit}%.4f"
++    metric.getClass.getName + "|" + parts.mkString(",")
++  }
++
++  private def all_codepoints(): List[Int] = {
++    val from_codes  = isabelle.Symbol.symbols.entries.flatMap(_.code.toList)
++    val from_symbols = Symbol.symbols.entries.flatMap(_.decode.toList).flatMap(_.codePoints().toArray.toList)
++    (from_codes ++ from_symbols).distinct.sorted
++  }
++
++  def dump(metric: isabelle.Pretty.Metric, channel: isabelle.vscode.Channel): Unit = {
++    val sig = signature(metric)
++    if (seen.putIfAbsent(sig, java.lang.Boolean.TRUE) != null) return
++
++    val codepoints = all_codepoints()
++    val rows = codepoints.map { codepoint_int =>
++      val char = new String(Character.toChars(codepoint_int))
++      val width = metric(char)
++      f"$codepoint_int%06d,U+${codepoint_int}%04X,$char,$width%.4f"
++    }
++
++    val csv =
++      "codepoint_dec,codepoint_hex,char,width\n" + rows.mkString("\n")
++
++    val file = isabelle.Isabelle_System.tmp_file("vscode_metric-", ".csv")
++    isabelle.File.write(file, csv)
++    channel.log_writeln(s"[VSCode_Metric_Dump] wrote .csv ${rows.length} rows to " + file.getAbsolutePath)
++  }
++}
+diff -r 7d6e6531de61 src/Tools/VSCode/src/state_panel.scala
+--- a/src/Tools/VSCode/src/state_panel.scala	Sun Sep 07 22:37:57 2025 +0100
++++ b/src/Tools/VSCode/src/state_panel.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -14,6 +14,11 @@
+   private val make_id = Counter.make()
+   private val instances = Synchronized(Map.empty[Counter.ID, State_Panel])
+ 
++  def receive_reformat(): Unit =
++    instances.value.values.foreach { st =>
++      st.server.editor.send_dispatcher(st.pretty_panel.value.reformat())
++    }
++
+   def init(id: LSP.Id, server: Language_Server): Unit = {
+     val instance = new State_Panel(server)
+     instances.change(_ + (instance.id -> instance))
+diff -r 7d6e6531de61 src/Tools/VSCode/src/vscode_metric.scala
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/src/vscode_metric.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,22 @@
++/*  Author:     Ali Prokoph
++
++The metric stores relative symbol widths ("ratios") and calculates string lengths.
++*/
++
++package isabelle.vscode
++
++import isabelle._
++
++final case class VSCode_Metric(ratios: Map[Int, Double]) extends Pretty.Metric {
++  def unit: Double = 1.0
++  def apply(s: String): Double = {
++    var length = 0.0;
++    var i = 0
++    while (i < s.length) {
++      val codepoint = s.codePointAt(i)
++      length += ratios.getOrElse(codepoint, 1.0)
++      i += java.lang.Character.charCount(codepoint)
++    }
++    length
++  }
++}
+diff -r 7d6e6531de61 src/Tools/VSCode/src/vscode_metric_manager.scala
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/src/vscode_metric_manager.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,58 @@
++/*  Author:     Ali Prokoph
++
++Component returns a viable metric, dependent on user input and availability in vscode_metric_store.
++should_probe() returns information about the current state as boolean.
++*/
++
++package isabelle.vscode
++import isabelle._
++
++object VSCode_Metric_Manager {
++  private final val Switch_To_Symbol_Metric = "switch_to_symbol_metric"
++  @volatile private var force_default: Boolean = false
++  @volatile private var current_fp: Option[String] = None
++  @volatile private var current_table: Option[Map[Int, Double]] = None
++
++  def load_store(): Unit = VSCode_Metric_Store.load()
++
++  def set(fp: String, width_table: Map[Int, Double]): Boolean = synchronized {
++    val changed = !current_table.contains(width_table)
++    current_fp = Some(fp)
++    current_table = Some(width_table)
++    if (width_table.nonEmpty) VSCode_Metric_Store.put(fp, width_table)
++    changed
++  }
++
++  def set_fingerprint_only(fp: String): Unit = {
++    if (fp == Switch_To_Symbol_Metric) {
++      force_default = true
++      current_fp = None
++      log_switch("-> force Symbol.Metric")
++      broadcast_reformat()
++    } else {
++      force_default = false
++      current_fp = Some(fp)
++      log_switch(s"-> use VSCode metric for fp=$fp (if available)")
++      broadcast_reformat()
++    }
++  }
++
++  def should_probe(fp: String): Boolean =
++    fp != Switch_To_Symbol_Metric && VSCode_Metric_Store.get(fp).isEmpty
++
++  def current_metric_or_default(): Pretty.Metric =
++    if (force_default) Symbol.Metric
++    else current_fp
++      .flatMap(fp => VSCode_Metric_Store.get(fp).map(VSCode_Metric(_)))
++      .getOrElse(Symbol.Metric)
++
++  private def log_switch(msg: String): Unit =
++    isabelle.Output.writeln("[VSCode_Metric_Manager] " + msg)
++
++  def metric: Pretty.Metric =
++    current_table.map(VSCode_Metric.apply).getOrElse(Symbol.Metric)
++
++  def broadcast_reformat(): Unit = {
++    State_Panel.receive_reformat()
++  }
++}
+diff -r 7d6e6531de61 src/Tools/VSCode/src/vscode_metric_store.scala
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/Tools/VSCode/src/vscode_metric_store.scala	Wed Oct 15 15:21:26 2025 +0200
+@@ -0,0 +1,73 @@
++/*  Author:     Ali Prokoph
++
++Component to store symbol width tables and their corresponding fingerprints
++in a .json file for persistent storage.
++*/
++
++package isabelle.vscode
++
++import isabelle._
++
++object VSCode_Metric_Store {
++  private val store_path: Path =
++    Path.explode("$ISABELLE_HOME_USER/vscode/metric_store.json")
++
++  private val tables = Synchronized(Map.empty[String, Map[Int, Double]])
++
++  def get(fp: String): Option[Map[Int, Double]] = tables.value.get(fp)
++
++  def put(fp: String, tab: Map[Int, Double]): Unit = {
++    tables.change(_ + (fp -> tab))
++    save()
++  }
++
++  private def encode_table(tab: Map[Int, Double]): JSON.T = {
++    tab.toList.sortBy(_._1).map { case (cp, w) => List(cp, w) }
++  }
++
++  private def decode_table(json: JSON.T): Option[Map[Int, Double]] = {
++    def parse_pair(x: JSON.T): Option[(Int, Double)] =
++      JSON.Value.List.unapply(x, (y: JSON.T) => Some(y)) flatMap {
++        case List(cp_j, w_j) =>
++          (cp_j, w_j) match {
++            case (JSON.Value.Int(cp), JSON.Value.Double(w)) => Some(cp -> w)
++            case (JSON.Value.Long(cp), JSON.Value.Double(w)) => Some(cp.toInt -> w)
++            case (JSON.Value.Int(cp), JSON.Value.Int(wi)) => Some(cp -> wi.toDouble)
++            case (JSON.Value.Long(cp), JSON.Value.Int(wi)) => Some(cp.toInt -> wi.toDouble)
++            case _ => None
++          }
++        case _ => None
++      }
++
++    JSON.Value.List.unapply(json, (elem: JSON.T) => Some(elem)).map(_.flatMap(parse_pair).toMap)
++  }
++
++  private def save(): Unit = {
++    val tables_obj = JSON.Object(
++      tables.value.toList.map { case (fp, tab) => (fp, encode_table(tab)) }:_*
++    )
++    val payload = JSON.Object(
++      "tables" -> tables_obj
++    )
++    Isabelle_System.make_directory(store_path.dir)
++    File.write(store_path, JSON.Format(payload))
++  }
++
++  def load(): Unit = {
++    if (store_path.is_file) {
++      JSON.parse(File.read(store_path)) match {
++        case JSON.Object(obj) =>
++          val tables_from_file =
++            JSON.value(obj, "tables")
++              .collect { case JSON.Object(entries) => entries }
++              .map { entries =>
++                entries.flatMap { case (fp, j) => decode_table(j).map(fp -> _) }.toMap
++              }
++
++          tables.change(_ => tables_from_file.getOrElse(Map.empty))
++        case _ =>
++          tables.change(_ => Map.empty)
++      }
++    }
++  }
++}
